@@ -1,0 +1,1710 @@
+# ============================================================
+# CLEAN HARD-RULE SOLVER (CP-SAT) — History-aware + Ramadan-ready
+#
+# ✅ Ramadan START uncertainty ONLY -> 2 rosters (not 4)
+# ✅ Prefix-lock identical rosters before break point
+# ✅ Strong preference markers (kept = thick border, not kept = lavender fill)
+# ✅ DO distribution soft shaping (NATURAL roster feel) without breaking hard rules
+# ✅ Strict validator checks ALL hard rules + DO streak nonpref
+# ✅ Summary metrics: preference kept %, DO quality (1DO/2DO blocks etc.)
+# ✅ NEW: Solver time + workers + restarts are taken from Params.xlsx
+# ✅ NEW: "Score-optimized" => best objective among multiple restarts is selected per scenario
+# ✅ NEW: Additional hard leaves locked: CL, SL (AL, ML, LWP, TR remain)
+#
+# Upload 3 files:
+#   1) Agent.xlsx
+#   2) HC_.xlsx
+#   3) Params.xlsx
+#
+# Outputs:
+#   Roster_SOLVED_YYYYMM_S1.xlsx
+#   Roster_SOLVED_YYYYMM_S2.xlsx
+#
+# ============================================================
+
+!pip -q install ortools openpyxl pandas==2.2.2 numpy
+
+import math
+import re as _re
+import numpy as np
+import pandas as pd
+from datetime import datetime, date as ddate
+from openpyxl import load_workbook
+from openpyxl.styles import PatternFill, Border, Side
+from ortools.sat.python import cp_model
+from google.colab import files
+
+# ----------------------------
+# Upload
+# ----------------------------
+print("Upload 3 files: Agent.xlsx, HC_.xlsx, Params.xlsx")
+uploaded = files.upload()
+
+agent_name = None
+hc_name = None
+params_name = None
+
+for fn in uploaded.keys():
+    low = fn.lower()
+    if "params" in low and low.endswith(".xlsx"):
+        params_name = fn
+    elif "hc" in low and low.endswith(".xlsx"):
+        hc_name = fn
+    elif low.endswith(".xlsx"):
+        agent_name = fn
+
+if not agent_name or not hc_name or not params_name:
+    raise ValueError("Need 3 files: Agent.xlsx, HC_.xlsx, Params.xlsx")
+
+print("Agent:", agent_name)
+print("HC_   :", hc_name)
+print("Params:", params_name)
+
+# ----------------------------
+# Constants & helpers
+# ----------------------------
+DAYTYPE_ROW = 1
+DATE_ROW    = 2
+FIRST_AGENT_ROW = 3
+
+_time_re = _re.compile(r"^(\d{1,2}):(\d{2})(?::(\d{2}))?\s*(AM|PM)?$", _re.I)
+
+def norm_date_cell(v):
+    if isinstance(v, datetime): return v.date()
+    if isinstance(v, ddate): return v
+    return None
+
+def _strip_commas(s: str) -> str:
+    return s.replace(",", "").strip()
+
+def as_int(x, default=0):
+    if x is None: return default
+    if isinstance(x, (int, bool)): return int(x)
+    if isinstance(x, float):
+        if math.isnan(x): return default
+        return int(x)
+    s = _strip_commas(str(x))
+    if not s: return default
+    v = pd.to_numeric(s, errors="coerce")
+    return default if pd.isna(v) else int(v)
+
+def as_float(x, default=0.0):
+    if x is None: return default
+    if isinstance(x, (int, float)):
+        if isinstance(x, float) and math.isnan(x): return default
+        return float(x)
+    s = _strip_commas(str(x))
+    if not s: return default
+    v = pd.to_numeric(s, errors="coerce")
+    return default if pd.isna(v) else float(v)
+
+def truthy(x):
+    if x is None: return False
+    s = str(x).strip().upper()
+    return s in ("1", "Y", "YES", "TRUE", "T")
+
+def find_header_col(ws, name, rows=(1,2,3,4,5), max_cols=250):
+    target = name.strip().lower()
+    for r in rows:
+        for c in range(1, max_cols+1):
+            v = ws.cell(r,c).value
+            if isinstance(v, str) and v.strip().lower() == target:
+                return c
+    return None
+
+def normalize_token(v):
+    """
+    Normalize:
+      - Excel time fraction -> "HH:MM"
+      - datetime -> "HH:MM"
+      - 'Night' / 'N' -> "N"
+      - 'DO*' -> "DO"
+      - Leaves -> as-is (upper)
+    IMPORTANT: datetime.date in shift cells => ignore
+    """
+    if v is None:
+        return ""
+
+    # Excel time fraction
+    if isinstance(v, (int, float)):
+        if isinstance(v, float) and math.isnan(v):
+            return ""
+        x = float(v)
+        if 0 <= x < 1.0:
+            minutes = int(round(x * 24 * 60))
+            hh = (minutes // 60) % 24
+            mm = minutes % 60
+            if (hh, mm) == (22, 0): return "N"
+            return f"{hh:02d}:{mm:02d}"
+
+    # Excel datetime
+    if isinstance(v, datetime):
+        hh, mm = v.hour, v.minute
+        if (hh, mm) == (22, 0): return "N"
+        return f"{hh:02d}:{mm:02d}"
+
+    # avoid old bug
+    if isinstance(v, ddate):
+        return ""
+
+    s = str(v).strip()
+    if not s:
+        return ""
+
+    u = s.upper().strip()
+
+    # DO
+    if u.startswith("DO"):
+        return "DO"
+
+    # NIGHT
+    if u == "N" or "NIGHT" in u:
+        return "N"
+
+    # "HH:MM:SS"
+    if _re.match(r"^\d{1,2}:\d{2}:\d{2}$", s):
+        hh, mm, _ = s.split(":")
+        hh, mm = int(hh), int(mm)
+        if (hh, mm) == (22, 0): return "N"
+        return f"{hh:02d}:{mm:02d}"
+
+    # time parse
+    m = _time_re.match(s)
+    if m:
+        hh = int(m.group(1)); mm = int(m.group(2))
+        ap = (m.group(4) or "").upper()
+        if ap == "PM" and hh < 12: hh += 12
+        if ap == "AM" and hh == 12: hh = 0
+        if (hh, mm) == (22, 0): return "N"
+        return f"{hh:02d}:{mm:02d}"
+
+    # normalize common mistakes
+    if u == "9:00":  return "09:00"
+    if u == "7:30":  return "07:30"
+    if u == "2:00":  return "14:00"
+    if u == "4:00":  return "16:00"
+
+    return u
+
+def parse_csv(val):
+    if val is None: return []
+    if isinstance(val, float) and math.isnan(val): return []
+    raw = str(val).strip().strip('"').strip("'")
+    if not raw: return []
+    out=[]
+    for p in raw.split(","):
+        p=p.strip()
+        if p:
+            out.append(p)
+    return out
+
+def parse_csv_shifts(val):
+    return [normalize_token(x) for x in parse_csv(val)]
+
+def shift_start_float(tok: str) -> float:
+    if tok == "N":
+        return 22.0
+    m = _re.match(r"^(\d{2}):(\d{2})$", tok)
+    if not m:
+        return None
+    hh = int(m.group(1))
+    mm = int(m.group(2))
+    return hh + mm/60.0
+
+def parse_date_param(x):
+    if x is None: return None
+    s = str(x).strip()
+    if not s: return None
+    dt = pd.to_datetime(s, dayfirst=True, errors="coerce")
+    if pd.isna(dt): return None
+    return dt.date()
+
+# ----------------------------
+# Load Params.xlsx
+# ----------------------------
+params_df = pd.read_excel(params_name)
+params_df.columns = [str(c).strip().lower() for c in params_df.columns]
+pcol = next((c for c in params_df.columns if "parameter" in c), None)
+vcol = next((c for c in params_df.columns if "value" in c), None)
+if not pcol or not vcol:
+    raise ValueError("Params.xlsx must have columns: Parameter, Value")
+
+params = {str(r[pcol]).strip().lower(): r[vcol] for _, r in params_df.iterrows()}
+
+def gp(key, default=None):
+    return params.get(key.lower(), default)
+
+# --- Hard leaves: UPDATED (AL, ML, LWP, CL, SL, TR) + optional extras from params
+HARD_LEAVES = {"AL", "ML", "LWP", "CL", "SL", "TR"}
+extra_hard_leaves = set([str(x).strip().upper() for x in parse_csv(gp("hard_leaves_extra", ""))])
+HARD_LEAVES |= extra_hard_leaves
+
+MAX_CONSEC = as_int(gp("max_consecutive_days", 6), 6)
+MIN_REST_HOURS = as_float(gp("min_rest_hours", 18), 18.0)
+
+MEETING_MIN_DAY = as_int(gp("meeting_min_day", 7), 7)
+MEETING_MAX_DAY = as_int(gp("meeting_max_day", 22), 22)
+MEETING_WD_ONLY = str(gp("meeting_wd_only", "Y")).strip().upper() in ("Y","YES","1","TRUE")
+MEET_SHIFT_NORMAL  = normalize_token(gp("meeting_shift_normal", "09:00"))
+MEET_SHIFT_RAMADAN = normalize_token(gp("meeting_shift_ramadan", "09:00"))
+
+DO_TARGET = as_int(gp("do_target_nonleave", 10), 10)
+DO_EXACT = str(gp("do_exact", "Y")).strip().upper() in ("Y","YES","1","TRUE")
+DO_FALLBACK_MINUS = as_int(gp("do_fallback_minus", 2), 2)
+
+NIGHT_MAX_CONSEC = as_int(gp("night_max_consec", 2), 2)
+
+ALLOWED_WD_OVERSTAFF = set(parse_csv_shifts(gp("wd_overstaff_shifts", "10:00")))
+NO_OVERSTAFF_ALWAYS = set(parse_csv_shifts(gp("no_overstaff_shifts", "N"))) | {"N"}
+
+MAX_N_PER_MALE = gp("max_n_per_male", None)
+MAX_N_PER_MALE = None if MAX_N_PER_MALE is None else as_int(MAX_N_PER_MALE, None)
+
+CAP_EVENING_SHIFTS = set(parse_csv_shifts(gp("cap_group_evening_shifts", "")))
+MAX_EVENING_PER_MALE = gp("max_evening_per_male", None)
+MAX_EVENING_PER_MALE = None if MAX_EVENING_PER_MALE is None else as_int(MAX_EVENING_PER_MALE, None)
+
+BOOST10_DAYS = [as_int(x) for x in parse_csv(gp("boost_10_days", "")) if str(x).strip()]
+BOOST10_AMOUNT = as_int(gp("boost_10_amount", 0), 0)
+
+# Hard DO streak rule for NON-preference streak only
+MAX_DO_STREAK_NONPREF = gp("max_do_streak_nonpref", 3)
+MAX_DO_STREAK_NONPREF = None if MAX_DO_STREAK_NONPREF is None else as_int(MAX_DO_STREAK_NONPREF, 3)
+
+# Soft weights
+W_BOOST10    = as_int(gp("w_boost10", 0), 0)
+W_SMOOTH10   = as_int(gp("w_smooth10", 0), 0)
+W_PREF_SOFT  = as_int(gp("w_pref_soft", 0), 0)
+W_FAIR_N     = as_int(gp("w_fair_n", 0), 0)
+W_FAIR_EVE   = as_int(gp("w_fair_16", 0), 0)
+W_3_NONLEAVE = as_int(gp("w_3_non_leave", 0), 0)
+
+# Option A DO shaping
+W_REWARD_DODO_AFTER_WORK4 = as_int(gp("w_reward_dodo_after_work4", 0), 0)
+W_REWARD_DODO_AFTER_WORK5 = as_int(gp("w_reward_dodo_after_work5", 0), 0)
+W_REWARD_DODO_ANYWHERE    = as_int(gp("w_reward_dodo_anywhere", 0), 0)
+
+W_PENALTY_ISOLATED_DO         = as_int(gp("w_penalty_isolated_do", 0), 0)
+W_PENALTY_SHORTWORK_BEFORE_DO = as_int(gp("w_penalty_shortwork_before_do", 0), 0)
+W_PENALTY_DODODO_NONPREF      = as_int(gp("w_penalty_dododo_nonpref", 0), 0)
+
+# Scenario mode + Ramadan date options (START uncertainty only)
+scenario_mode = str(gp("scenario_mode", "MULTI")).strip().upper()
+RAM_START_1 = parse_date_param(gp("ramadan_start_option_1", None))
+RAM_START_2 = parse_date_param(gp("ramadan_start_option_2", None))
+RAM_END_1   = parse_date_param(gp("ramadan_end_option_1", None))
+RAM_END_2   = parse_date_param(gp("ramadan_end_option_2", None))
+
+GH_OPT_1    = parse_date_param(gp("gh_option_1", None))
+GH_OPT_2    = parse_date_param(gp("gh_option_2", None))
+
+# NEW: solver controls from Params
+SOLVER_TIME_SECONDS = as_float(gp("solver_time_seconds", 240), 240.0)
+SOLVER_WORKERS      = as_int(gp("solver_workers", 8), 8)
+SOLVER_RESTARTS     = as_int(gp("solver_restarts", 3), 3)     # try multiple random seeds
+SOLVER_RAND_BASE    = as_int(gp("solver_rand_base", 1234), 1234)
+
+print("\nParams used:")
+print(f"  HARD_LEAVES           = {sorted(HARD_LEAVES)}")
+print(f"  max_consecutive_days  = {MAX_CONSEC}")
+print(f"  min_rest_hours        = {MIN_REST_HOURS}")
+print(f"  DO target             = {DO_TARGET} | exact={DO_EXACT} | fallback_minus={DO_FALLBACK_MINUS}")
+print(f"  meeting window        = [{MEETING_MIN_DAY}..{MEETING_MAX_DAY}] | wd_only={MEETING_WD_ONLY}")
+print(f"  meeting shift normal  = {MEET_SHIFT_NORMAL} | ramadan = {MEET_SHIFT_RAMADAN}")
+print(f"  WD overstaff allowed  = {sorted(ALLOWED_WD_OVERSTAFF)}")
+print(f"  no-overstaff always   = {sorted(NO_OVERSTAFF_ALWAYS)}")
+print(f"  cap max_n_per_male    = {MAX_N_PER_MALE}")
+print(f"  cap evening shifts    = {sorted(CAP_EVENING_SHIFTS)} | max_evening_per_male={MAX_EVENING_PER_MALE}")
+print(f"  boost10 days={BOOST10_DAYS} amount={BOOST10_AMOUNT}")
+print(f"  max_do_streak_nonpref = {MAX_DO_STREAK_NONPREF}")
+print("  Weights (soft):")
+print(f"    pref={W_PREF_SOFT}, fairN={W_FAIR_N}, fairEve={W_FAIR_EVE}, boost10={W_BOOST10}, smooth10={W_SMOOTH10}, w_3_non_leave={W_3_NONLEAVE}")
+print(f"    reward_dodo_work4={W_REWARD_DODO_AFTER_WORK4}, reward_dodo_work5={W_REWARD_DODO_AFTER_WORK5}, reward_dodo_anywhere={W_REWARD_DODO_ANYWHERE}")
+print(f"    penalty_isolated_do={W_PENALTY_ISOLATED_DO}, penalty_shortwork_before_do={W_PENALTY_SHORTWORK_BEFORE_DO}, penalty_dododo_nonpref={W_PENALTY_DODODO_NONPREF}")
+print("  Solver:")
+print(f"    time={SOLVER_TIME_SECONDS}s, workers={SOLVER_WORKERS}, restarts={SOLVER_RESTARTS}, rand_base={SOLVER_RAND_BASE}")
+
+# ----------------------------
+# Load HC_.xlsx
+# ----------------------------
+hc = pd.read_excel(hc_name)
+hc.columns = [str(c).strip() for c in hc.columns]
+
+def find_col(cols, needle):
+    needle = needle.lower()
+    for c in cols:
+        if needle in str(c).lower():
+            return c
+    return None
+
+COL_PERIOD = find_col(hc.columns, "period")
+COL_SHIFT  = find_col(hc.columns, "shift")
+if COL_PERIOD is None or COL_SHIFT is None:
+    raise ValueError("HC_.xlsx must have columns: Period, Shift")
+
+COL_WD   = find_col(hc.columns, "headcount on wd")
+COL_FRI  = find_col(hc.columns, "headcount on friday")
+COL_SAT  = find_col(hc.columns, "headcount on saturday")
+COL_GH   = find_col(hc.columns, "headcount on gh")
+COL_EID  = find_col(hc.columns, "headcount on eid")
+if COL_WD is None or COL_FRI is None or COL_SAT is None:
+    raise ValueError("HC_.xlsx must have demand columns: Headcount on WD/Friday/Saturday")
+
+COL_S1_WD  = find_col(hc.columns, "s1 wd")
+COL_S1_FRI = find_col(hc.columns, "s1 friday")
+COL_S1_SAT = find_col(hc.columns, "s1 saturday")
+COL_S1_GH  = find_col(hc.columns, "s1 gh")
+COL_S1_EID = find_col(hc.columns, "s1 eid")
+
+COL_MALE_ONLY = find_col(hc.columns, "male only")
+if COL_MALE_ONLY is None:
+    raise ValueError("HC_.xlsx must have a 'Male Only' column (0/1).")
+
+periods = sorted(set(str(x).strip() for x in hc[COL_PERIOD].dropna().unique()))
+if "Normal" not in periods:
+    print("WARNING: HC_ has no 'Normal' period row names. Found:", periods)
+
+demand = {}
+s1_req = {}
+male_only = {}
+
+for per in periods:
+    demand[per] = {"WD":{}, "FRI":{}, "SAT":{}, "GH":{}, "EID":{}}
+    s1_req[per] = {"WD":{}, "FRI":{}, "SAT":{}, "GH":{}, "EID":{}}
+
+all_shifts = set()
+
+for _, r in hc.iterrows():
+    per = str(r[COL_PERIOD]).strip()
+    sh_raw = r[COL_SHIFT]
+    sh = normalize_token(sh_raw)
+    if str(sh_raw).strip().lower() == "night":
+        sh = "N"
+
+    if not sh:
+        continue
+    if sh != "N" and not _re.match(r"^\d{2}:\d{2}$", sh):
+        continue
+
+    all_shifts.add(sh)
+
+    demand[per]["WD"][sh]  = as_int(r[COL_WD], 0)
+    demand[per]["FRI"][sh] = as_int(r[COL_FRI], 0)
+    demand[per]["SAT"][sh] = as_int(r[COL_SAT], 0)
+    demand[per]["GH"][sh]  = as_int(r[COL_GH], 0) if COL_GH else 0
+    demand[per]["EID"][sh] = as_int(r[COL_EID], 0) if COL_EID else 0
+
+    if COL_S1_WD:  s1_req[per]["WD"][sh]  = as_int(r[COL_S1_WD], 0)
+    if COL_S1_FRI: s1_req[per]["FRI"][sh] = as_int(r[COL_S1_FRI], 0)
+    if COL_S1_SAT: s1_req[per]["SAT"][sh] = as_int(r[COL_S1_SAT], 0)
+    if COL_S1_GH:  s1_req[per]["GH"][sh]  = as_int(r[COL_S1_GH], 0)
+    if COL_S1_EID: s1_req[per]["EID"][sh] = as_int(r[COL_S1_EID], 0)
+
+    if as_int(r[COL_MALE_ONLY], 0) == 1:
+        male_only[sh] = 1
+
+SHIFT_START = {}
+for sh in all_shifts:
+    SHIFT_START[sh] = 22.0 if sh == "N" else shift_start_float(sh)
+    if SHIFT_START[sh] is None:
+        raise ValueError(f"HC_ has a shift that cannot be parsed as time: {sh}")
+
+WORK_SHIFTS = set(SHIFT_START.keys())
+
+print("\nHC_ periods found:", periods)
+print("All shifts from HC_:", sorted(all_shifts, key=lambda x: SHIFT_START[x]))
+
+# ----------------------------
+# Load Agent workbook
+# ----------------------------
+wbA = load_workbook(agent_name)
+wsA = wbA.active
+
+COL_ID   = find_header_col(wsA, "Agent ID") or 3
+COL_GEND = find_header_col(wsA, "Gender")
+COL_SUP  = find_header_col(wsA, "Supervisor")
+COL_STAR = find_header_col(wsA, "Star")
+COL_S1   = find_header_col(wsA, "S1")
+
+if COL_SUP is None:  raise ValueError("Agent.xlsx must have Supervisor column.")
+if COL_GEND is None: raise ValueError("Agent.xlsx must have Gender column.")
+if COL_S1 is None:   raise ValueError("Agent.xlsx must have S1 column.")
+
+date_cols=[]
+for c in range(1, wsA.max_column+1):
+    d = norm_date_cell(wsA.cell(DATE_ROW,c).value)
+    if d:
+        date_cols.append((c,d))
+date_cols.sort(key=lambda x:x[1])
+
+counts={}
+for _, d in date_cols:
+    counts[(d.year, d.month)] = counts.get((d.year, d.month), 0) + 1
+if not counts:
+    raise ValueError("No date columns found in Agent.xlsx row 2.")
+(year_ref, month_ref) = max(counts.items(), key=lambda kv: kv[1])[0]
+
+month_cols=[(c,d) for c,d in date_cols if (d.year, d.month)==(year_ref, month_ref)]
+month_cols.sort(key=lambda x:x[1])
+days=[d for _,d in month_cols]
+col_for_day={d:c for c,d in month_cols}
+D=len(days)
+if D==0:
+    raise ValueError("Could not detect month columns.")
+
+month_start = days[0]
+month_end = days[-1]
+
+hist_cols=[(c,d) for c,d in date_cols if d < month_start]
+hist_cols.sort(key=lambda x:x[1])
+hist_cols = hist_cols[-6:] if len(hist_cols)>=6 else hist_cols
+hist_days=[d for _,d in hist_cols]
+hist_col_for_day={d:c for c,d in hist_cols}
+
+print(f"\nMonth detected: {year_ref}-{month_ref:02d} | days={D}")
+print(f"History days present: {len(hist_days)} ({hist_days[0] if hist_days else None}..{hist_days[-1] if hist_days else None})")
+
+marker={}
+for d in days:
+    v = wsA.cell(DAYTYPE_ROW, col_for_day[d]).value
+    marker[d] = str(v).strip().upper() if v is not None else ""
+
+def base_day_type(d):
+    m = marker.get(d,"")
+    if m=="GH":  return "GH"
+    if m=="EID": return "EID"
+    wd = d.weekday()
+    if wd==4: return "FRI"
+    if wd==5: return "SAT"
+    return "WD"
+
+EXACT_TYPES = {"FRI","SAT","GH","EID"}
+
+agent_rows=[]
+r=FIRST_AGENT_ROW
+while r<=wsA.max_row:
+    aid=wsA.cell(r, COL_ID).value
+    if aid is None or str(aid).strip()=="":
+        break
+    agent_rows.append(r)
+    r+=1
+
+agent_ids=[str(wsA.cell(rr, COL_ID).value).strip() for rr in agent_rows]
+A=len(agent_ids)
+
+def norm_gender(x):
+    if x is None: return ""
+    s=str(x).strip().upper()
+    if s.startswith("M"): return "M"
+    if s.startswith("F"): return "F"
+    return ""
+
+meta={}
+sup_to_team={}
+for rr,a in zip(agent_rows, agent_ids):
+    g = norm_gender(wsA.cell(rr, COL_GEND).value)
+    sup = str(wsA.cell(rr, COL_SUP).value).strip() if wsA.cell(rr, COL_SUP).value is not None else ""
+    star = truthy(wsA.cell(rr, COL_STAR).value) if COL_STAR else False
+    s1 = truthy(wsA.cell(rr, COL_S1).value)
+    meta[a]={"gender":g,"sup":sup,"star":star,"s1":s1}
+    if sup:
+        sup_to_team.setdefault(sup, []).append(a)
+
+supervisors = sorted(sup_to_team.keys())
+print(f"Agents: {A} | Supervisors: {len(supervisors)}")
+
+tmpl_token={(a,d): normalize_token(wsA.cell(rr, col_for_day[d]).value)
+            for rr,a in zip(agent_rows, agent_ids)
+            for d in days}
+
+hist_token={(a,d): normalize_token(wsA.cell(rr, hist_col_for_day[d]).value)
+            for rr,a in zip(agent_rows, agent_ids)
+            for d in hist_days}
+
+# ----------------------------
+# Locks:
+# - hard leave locks
+# - DO-between-AL locks
+# - star-hard locks
+# ----------------------------
+locks={}
+lock_reason={}
+
+for a in agent_ids:
+    for d in days:
+        t = tmpl_token[(a,d)]
+        if t in HARD_LEAVES:
+            locks[(a,d)] = t
+            lock_reason[(a,d)] = "leave"
+
+# DO-between-AL locks
+for a in agent_ids:
+    for i in range(D):
+        if tmpl_token[(a, days[i])] != "DO":
+            continue
+        L = i-1
+        while L>=0 and tmpl_token[(a, days[L])] == "DO":
+            L -= 1
+        R = i+1
+        while R<D and tmpl_token[(a, days[R])] == "DO":
+            R += 1
+        left_is_al  = (L>=0 and tmpl_token[(a, days[L])] == "AL")
+        right_is_al = (R<D and tmpl_token[(a, days[R])] == "AL")
+        if left_is_al and right_is_al:
+            for k in range(L+1, R):
+                dk = days[k]
+                if (a,dk) not in locks:
+                    locks[(a,dk)] = "DO"
+                    lock_reason[(a,dk)] = "do_between_al"
+
+# star-hard locks
+for a in agent_ids:
+    if not meta[a]["star"]:
+        continue
+    for d in days:
+        if (a,d) in locks:
+            continue
+        t = tmpl_token[(a,d)]
+        if t in WORK_SHIFTS or t=="DO":
+            locks[(a,d)] = t
+            lock_reason[(a,d)] = "star"
+
+leave_agents=set()
+for a in agent_ids:
+    if any((a,d) in locks and lock_reason[(a,d)]=="leave" for d in days):
+        leave_agents.add(a)
+
+# ----------------------------
+# Scenario builder (START uncertainty only)
+# - No cross product start×end
+# - If end blank -> treat as month_end
+# ----------------------------
+ram_starts=[d for d in [RAM_START_1, RAM_START_2] if d is not None]
+ram_starts = sorted(set(ram_starts))
+
+ram_end_candidates=[d for d in [RAM_END_1, RAM_END_2] if d is not None]
+if len(ram_end_candidates) >= 1:
+    effective_ram_end = min(ram_end_candidates)
+    if effective_ram_end > month_end:
+        effective_ram_end = month_end
+else:
+    effective_ram_end = month_end
+
+gh_opts=[d for d in [GH_OPT_1, GH_OPT_2] if d is not None]
+gh_opts = sorted(set(gh_opts))
+if not gh_opts:
+    gh_opts=[None]
+
+scenarios=[]
+if scenario_mode == "MULTI" and ram_starts:
+    for rs in ram_starts:
+        for ghd in gh_opts:
+            scenarios.append((rs, effective_ram_end, ghd))
+else:
+    scenarios=[(RAM_START_1, effective_ram_end if RAM_START_1 else None, GH_OPT_1 if GH_OPT_1 else None)]
+
+# unique
+scenarios = list(dict.fromkeys(scenarios))
+
+print("\nTrying scenario candidates:")
+print("Ramadan scenarios:", [(rs, re) for (rs,re,_) in scenarios])
+print("GH candidates    :", gh_opts)
+
+def day_period(d, ram_start, ram_end):
+    if ram_start is None or ram_end is None:
+        return "Normal"
+    if ram_start <= d <= ram_end:
+        return "Ramadan"
+    return "Normal"
+
+def day_type_with_gh_override(d, gh_override):
+    if gh_override is not None and d == gh_override:
+        return "GH"
+    return base_day_type(d)
+
+def require_exact(dt, shift):
+    if shift in NO_OVERSTAFF_ALWAYS:
+        return True
+    if dt in EXACT_TYPES:
+        return True
+    if dt=="WD":
+        return shift not in ALLOWED_WD_OVERSTAFF
+    return False
+
+# ----------------------------
+# Prefix lock: identical before earliest Ramadan start
+# ----------------------------
+def compute_prefix_lock_days():
+    if not ram_starts:
+        return []
+    brk = min(ram_starts)
+    return [d for d in days if d < brk]
+
+prefix_days = compute_prefix_lock_days()
+print("\nPrefix lock days:", (prefix_days[0], prefix_days[-1]) if prefix_days else None)
+
+prefix_locks = None
+
+# ----------------------------
+# Solver per scenario (with score-optimized restarts)
+# ----------------------------
+def solve_one_scenario(ram_start, ram_end, gh_override,
+                       hard_boost=True,
+                       extra_prefix_locks=None,
+                       time_limit_s=120.0,
+                       workers=8,
+                       random_seed=None):
+
+    period_of={}
+    daytype_of={}
+    for d in days:
+        per = day_period(d, ram_start, ram_end)
+        if per not in demand:
+            per = "Normal"
+        period_of[d]=per
+        daytype_of[d]=day_type_with_gh_override(d, gh_override)
+
+    def meeting_shift_for_day(d):
+        return MEET_SHIFT_RAMADAN if period_of[d]=="Ramadan" else MEET_SHIFT_NORMAL
+
+    TOKENS = sorted(list(WORK_SHIFTS), key=lambda s: SHIFT_START[s]) + ["DO"]
+    model = cp_model.CpModel()
+
+    # Variables
+    x={}
+    for ai,a in enumerate(agent_ids):
+        for di,d in enumerate(days):
+            locked = locks.get((a,d), None)
+
+            if extra_prefix_locks is not None and (a,d) in extra_prefix_locks:
+                locked = extra_prefix_locks[(a,d)]
+
+            for t in TOKENS:
+                x[(ai,di,t)] = model.NewBoolVar(f"x_{ai}_{di}_{t}")
+
+            if locked in HARD_LEAVES:
+                for t in TOKENS:
+                    model.Add(x[(ai,di,t)] == 0)
+            else:
+                model.Add(sum(x[(ai,di,t)] for t in TOKENS) == 1)
+                if locked is not None:
+                    for t in TOKENS:
+                        model.Add(x[(ai,di,t)] == (1 if t==locked else 0))
+
+    # Helper booleans: is_work(ai,di)
+    is_work={}
+    for ai,a in enumerate(agent_ids):
+        for di,d in enumerate(days):
+            if locks.get((a,d), None) in HARD_LEAVES:
+                is_work[(ai,di)] = None
+            else:
+                w = model.NewBoolVar(f"work_{ai}_{di}")
+                model.Add(w == sum(x[(ai,di,sh)] for sh in WORK_SHIFTS))
+                is_work[(ai,di)] = w
+
+    # Male-only shifts
+    male_only_shifts = set([s for s in WORK_SHIFTS if male_only.get(s,0)==1])
+    for ai,a in enumerate(agent_ids):
+        if meta[a]["gender"] == "M":
+            continue
+        for di,d in enumerate(days):
+            if locks.get((a,d), None) in HARD_LEAVES:
+                continue
+            for sh in male_only_shifts:
+                model.Add(x[(ai,di,sh)] == 0)
+
+    # HC constraints
+    for di,d in enumerate(days):
+        per = period_of[d]
+        dt  = daytype_of[d]
+        for sh in WORK_SHIFTS:
+            req = demand[per][dt].get(sh, 0)
+            total = sum(x[(ai,di,sh)] for ai in range(A))
+            if dt=="WD":
+                model.Add(total >= req)
+            if require_exact(dt, sh):
+                model.Add(total == req)
+
+    # S1 coverage
+    s1_idx=[i for i,a in enumerate(agent_ids) if meta[a]["s1"]]
+    for di,d in enumerate(days):
+        per = period_of[d]
+        dt  = daytype_of[d]
+        for sh in WORK_SHIFTS:
+            req_s1 = s1_req[per][dt].get(sh, 0)
+            if req_s1 <= 0:
+                continue
+            total_s1 = sum(
+                x[(ai,di,sh)]
+                for ai in s1_idx
+                if locks.get((agent_ids[ai], d), None) not in HARD_LEAVES
+            )
+            model.Add(total_s1 >= req_s1)
+
+    # Rest constraint
+    viol_pairs=[]
+    for s1 in WORK_SHIFTS:
+        for s2 in WORK_SHIFTS:
+            gap = (SHIFT_START[s2] + 24.0) - SHIFT_START[s1]
+            if gap < MIN_REST_HOURS - 1e-9:
+                viol_pairs.append((s1,s2))
+
+    for ai,a in enumerate(agent_ids):
+        for di in range(D-1):
+            d1=days[di]; d2=days[di+1]
+            if locks.get((a,d1),None) in HARD_LEAVES: continue
+            if locks.get((a,d2),None) in HARD_LEAVES: continue
+            for s1,s2 in viol_pairs:
+                model.Add(x[(ai,di,s1)] + x[(ai,di+1,s2)] <= 1)
+
+    # boundary history -> day0
+    if hist_days:
+        last_hist = hist_days[-1]
+        for ai,a in enumerate(agent_ids):
+            prev = hist_token.get((a,last_hist),"")
+            if prev in WORK_SHIFTS:
+                for s2 in WORK_SHIFTS:
+                    gap = (SHIFT_START[s2] + 24.0) - SHIFT_START[prev]
+                    if gap < MIN_REST_HOURS - 1e-9:
+                        if locks.get((a,days[0]),None) in HARD_LEAVES:
+                            continue
+                        model.Add(x[(ai,0,s2)] == 0)
+
+    # Max consecutive workdays (history-aware)
+    def hist_is_work(a, hd):
+        tok = hist_token.get((a,hd),"")
+        return 1 if tok in WORK_SHIFTS else 0
+
+    W = MAX_CONSEC + 1
+    Hn=len(hist_days)
+    ext_len=Hn + D
+
+    for ai,a in enumerate(agent_ids):
+        ext=[]
+        for hd in hist_days:
+            ext.append(hist_is_work(a,hd))
+        for di in range(D):
+            ext.append(0 if is_work[(ai,di)] is None else is_work[(ai,di)])
+
+        for start in range(0, ext_len - W + 1):
+            window=ext[start:start+W]
+            if all(isinstance(v,int) for v in window):
+                continue
+            model.Add(sum(window) <= MAX_CONSEC)
+
+    # Night rules (history-aware)
+    def ext_isN(ai, ext_i):
+        if ext_i < Hn:
+            tok = hist_token.get((agent_ids[ai], hist_days[ext_i]), "")
+            return 1 if tok=="N" else 0
+        di=ext_i-Hn
+        d=days[di]
+        a=agent_ids[ai]
+        if locks.get((a,d),None) in HARD_LEAVES:
+            return 0
+        return x[(ai,di,"N")] if "N" in WORK_SHIFTS else 0
+
+    def ext_isDO(ai, ext_i):
+        if ext_i < Hn:
+            tok = hist_token.get((agent_ids[ai], hist_days[ext_i]), "")
+            return 1 if tok=="DO" else 0
+        di=ext_i-Hn
+        d=days[di]
+        a=agent_ids[ai]
+        if locks.get((a,d),None) in HARD_LEAVES:
+            return 0
+        return x[(ai,di,"DO")]
+
+    def ext_isLeave(ai, ext_i):
+        if ext_i < Hn:
+            tok = hist_token.get((agent_ids[ai], hist_days[ext_i]), "")
+            return 1 if tok in HARD_LEAVES else 0
+        di=ext_i-Hn
+        d=days[di]
+        a=agent_ids[ai]
+        return 1 if locks.get((a,d),None) in HARD_LEAVES else 0
+
+    for ai,a in enumerate(agent_ids):
+        # NNN forbidden if max=2
+        if "N" in WORK_SHIFTS and NIGHT_MAX_CONSEC==2:
+            for start in range(0, ext_len-3+1):
+                touches_month = any((start+j) >= Hn for j in range(3))
+                if not touches_month: continue
+                model.Add(ext_isN(ai,start) + ext_isN(ai,start+1) + ext_isN(ai,start+2) <= 2)
+
+        # N must be followed by N or DO or Leave
+        if "N" in WORK_SHIFTS:
+            for i in range(0, ext_len-1):
+                if (i+1) < Hn:
+                    continue
+                model.Add(ext_isN(ai,i+1) + ext_isDO(ai,i+1) + ext_isLeave(ai,i+1) >= ext_isN(ai,i))
+
+        # Anti NDO NDO
+        if "N" in WORK_SHIFTS:
+            for i in range(0, ext_len-4+1):
+                if not any((i+j) >= Hn for j in range(4)):
+                    continue
+                model.Add(ext_isN(ai,i) + ext_isDO(ai,i+1) + ext_isN(ai,i+2) + ext_isDO(ai,i+3) <= 3)
+
+        # NN -> DO DO
+        if "N" in WORK_SHIFTS:
+            for i in range(0, ext_len-4+1):
+                if not any((i+j) >= Hn for j in range(4)):
+                    continue
+                n0=ext_isN(ai,i); n1=ext_isN(ai,i+1)
+                nn=model.NewBoolVar(f"nn_{ai}_{i}")
+                model.Add(nn <= n0)
+                model.Add(nn <= n1)
+                model.Add(nn >= n0 + n1 - 1)
+                for off in [2,3]:
+                    ext_j=i+off
+                    if ext_j < Hn:
+                        continue
+                    di=ext_j-Hn
+                    d=days[di]
+                    if locks.get((a,d),None) in HARD_LEAVES:
+                        continue
+                    model.Add(x[(ai,di,"DO")] == 1).OnlyEnforceIf(nn)
+
+    # DO count rule
+    for ai,a in enumerate(agent_ids):
+        do_cnt = 0
+        for di,d in enumerate(days):
+            if locks.get((a,d),None) in HARD_LEAVES:
+                continue
+            do_cnt += x[(ai,di,"DO")]
+
+        if a in leave_agents:
+            model.Add(do_cnt <= DO_TARGET)
+        else:
+            if DO_EXACT:
+                model.Add(do_cnt == DO_TARGET)
+            else:
+                model.Add(do_cnt >= max(0, DO_TARGET - DO_FALLBACK_MINUS))
+
+    # Caps
+    if MAX_N_PER_MALE is not None or (MAX_EVENING_PER_MALE is not None and CAP_EVENING_SHIFTS):
+        for ai,a in enumerate(agent_ids):
+            if meta[a]["gender"] != "M":
+                continue
+            n_cnt=0
+            eve_cnt=0
+            for di,d in enumerate(days):
+                if locks.get((a,d),None) in HARD_LEAVES:
+                    continue
+                if MAX_N_PER_MALE is not None and "N" in WORK_SHIFTS:
+                    n_cnt += x[(ai,di,"N")]
+                if MAX_EVENING_PER_MALE is not None and CAP_EVENING_SHIFTS:
+                    eve_cnt += sum(x[(ai,di,sh)] for sh in CAP_EVENING_SHIFTS if sh in WORK_SHIFTS)
+            if MAX_N_PER_MALE is not None and "N" in WORK_SHIFTS:
+                model.Add(n_cnt <= MAX_N_PER_MALE)
+            if MAX_EVENING_PER_MALE is not None and CAP_EVENING_SHIFTS:
+                model.Add(eve_cnt <= MAX_EVENING_PER_MALE)
+
+    # Meeting hard
+    def meeting_candidate(d):
+        if d.day < MEETING_MIN_DAY or d.day > MEETING_MAX_DAY:
+            return False
+        if MEETING_WD_ONLY and daytype_of[d] != "WD":
+            return False
+        return True
+
+    meeting_days=[di for di,d in enumerate(days) if meeting_candidate(d)]
+    if not meeting_days:
+        raise ValueError("No meeting candidate days found in the meeting window. Check params.")
+
+    for sup in supervisors:
+        team = sup_to_team[sup]
+        mvars=[]
+        for di in meeting_days:
+            mv=model.NewBoolVar(f"meet_{sup}_{di}")
+            mvars.append((di,mv))
+        model.Add(sum(mv for _,mv in mvars) == 1)
+
+        for di,mv in mvars:
+            d=days[di]
+            required_shift = meeting_shift_for_day(d)
+            if required_shift not in WORK_SHIFTS:
+                raise ValueError(f"Meeting shift {required_shift} not in HC_ shifts. Fix params/HC_.")
+            for a2 in team:
+                ai2 = agent_ids.index(a2)
+                if locks.get((a2,d),None) in HARD_LEAVES:
+                    continue
+                if lock_reason.get((a2,d), "") == "do_between_al":
+                    continue
+                model.Add(x[(ai2,di,required_shift)] == 1).OnlyEnforceIf(mv)
+
+    # HARD: DO streak non-pref max
+    if MAX_DO_STREAK_NONPREF is not None and MAX_DO_STREAK_NONPREF >= 1:
+        L = MAX_DO_STREAK_NONPREF + 1
+        for ai,a in enumerate(agent_ids):
+            for start in range(0, D - L + 1):
+                window_days = days[start:start+L]
+                if any(locks.get((a,wd),None) in HARD_LEAVES for wd in window_days):
+                    continue
+                if any(tmpl_token[(a,wd)] == "DO" for wd in window_days):
+                    continue
+                model.Add(sum(x[(ai, start+i, "DO")] for i in range(L)) <= L-1)
+
+    # FAILSAFE boost (hard -> soft)
+    boost_penalties=[]
+    def add_boost_rule(day_list, amount, shift_name):
+        for di,d in enumerate(days):
+            if d.day not in day_list:
+                continue
+            if daytype_of[d] != "WD":
+                continue
+            if shift_name not in ALLOWED_WD_OVERSTAFF:
+                continue
+            per = period_of[d]
+            req = demand[per]["WD"].get(shift_name, 0)
+            target = req + amount
+            total = sum(x[(ai,di,shift_name)] for ai in range(A))
+            if hard_boost:
+                model.Add(total >= target)
+            else:
+                deficit = model.NewIntVar(0, A, f"def_boost_{di}_{shift_name}")
+                model.Add(deficit >= target - total)
+                model.Add(deficit >= 0)
+                boost_penalties.append(deficit)
+
+    add_boost_rule(BOOST10_DAYS, BOOST10_AMOUNT, "10:00")
+
+    # ----------------------------
+    # Soft objectives (Option A DO shaping + fairness + prefs)
+    # ----------------------------
+    obj_terms=[]
+
+    # Soft preference matching
+    if W_PREF_SOFT > 0:
+        for ai,a in enumerate(agent_ids):
+            for di,d in enumerate(days):
+                if (a,d) in locks:
+                    continue
+                pref = tmpl_token[(a,d)]
+                if pref in TOKENS:
+                    bad=model.NewBoolVar(f"badpref_{ai}_{di}")
+                    model.Add(x[(ai,di,pref)] == 0).OnlyEnforceIf(bad)
+                    model.Add(x[(ai,di,pref)] == 1).OnlyEnforceIf(bad.Not())
+                    obj_terms.append(W_PREF_SOFT * bad)
+
+    # Soft penalty: 3 consecutive DO for NON-LEAVE agents (nonpref window)
+    if W_3_NONLEAVE > 0:
+        for ai,a in enumerate(agent_ids):
+            if a in leave_agents:
+                continue
+            for start in range(0, D-3+1):
+                window_days = [days[start+i] for i in range(3)]
+                if any(locks.get((a,dd),None) in HARD_LEAVES for dd in window_days):
+                    continue
+                if any(tmpl_token[(a,dd)] == "DO" for dd in window_days):
+                    continue
+                all3 = model.NewBoolVar(f"do3_{ai}_{start}")
+                s = x[(ai,start,"DO")] + x[(ai,start+1,"DO")] + x[(ai,start+2,"DO")]
+                model.Add(all3 <= x[(ai,start,"DO")])
+                model.Add(all3 <= x[(ai,start+1,"DO")])
+                model.Add(all3 <= x[(ai,start+2,"DO")])
+                model.Add(all3 >= s - 2)
+                obj_terms.append(W_3_NONLEAVE * all3)
+
+    # Helper: AND reification
+    def andify(lits, name):
+        b = model.NewBoolVar(name)
+        for lit in lits:
+            model.Add(b <= lit)
+        model.Add(b >= sum(lits) - (len(lits)-1))
+        return b
+
+    # Reward any DODO
+    if W_REWARD_DODO_ANYWHERE > 0:
+        for ai,a in enumerate(agent_ids):
+            for i in range(0, D-1):
+                d1, d2 = days[i], days[i+1]
+                if any(locks.get((a,dd),None) in HARD_LEAVES for dd in [d1,d2]):
+                    continue
+                if tmpl_token[(a,d1)] == "DO" or tmpl_token[(a,d2)] == "DO":
+                    continue
+                pat = andify([x[(ai,i,"DO")], x[(ai,i+1,"DO")]], f"dodo_{ai}_{i}")
+                obj_terms.append(-W_REWARD_DODO_ANYWHERE * pat)
+
+    # Reward W4 then DO DO
+    if W_REWARD_DODO_AFTER_WORK4 > 0:
+        for ai,a in enumerate(agent_ids):
+            for i in range(4, D-1):
+                ds = [days[i-4],days[i-3],days[i-2],days[i-1],days[i],days[i+1]]
+                if any(locks.get((a,dd),None) in HARD_LEAVES for dd in ds):
+                    continue
+                if tmpl_token[(a,days[i])] == "DO" or tmpl_token[(a,days[i+1])] == "DO":
+                    continue
+                lits = [
+                    is_work[(ai,i-4)], is_work[(ai,i-3)], is_work[(ai,i-2)], is_work[(ai,i-1)],
+                    x[(ai,i,"DO")], x[(ai,i+1,"DO")]
+                ]
+                if any(l is None for l in lits):
+                    continue
+                pat = andify(lits, f"w4_dodo_{ai}_{i}")
+                obj_terms.append(-W_REWARD_DODO_AFTER_WORK4 * pat)
+
+    # Reward W5 then DO DO
+    if W_REWARD_DODO_AFTER_WORK5 > 0:
+        for ai,a in enumerate(agent_ids):
+            for i in range(5, D-1):
+                ds = [days[i-5],days[i-4],days[i-3],days[i-2],days[i-1],days[i],days[i+1]]
+                if any(locks.get((a,dd),None) in HARD_LEAVES for dd in ds):
+                    continue
+                if tmpl_token[(a,days[i])] == "DO" or tmpl_token[(a,days[i+1])] == "DO":
+                    continue
+                lits = [
+                    is_work[(ai,i-5)], is_work[(ai,i-4)], is_work[(ai,i-3)], is_work[(ai,i-2)], is_work[(ai,i-1)],
+                    x[(ai,i,"DO")], x[(ai,i+1,"DO")]
+                ]
+                if any(l is None for l in lits):
+                    continue
+                pat = andify(lits, f"w5_dodo_{ai}_{i}")
+                obj_terms.append(-W_REWARD_DODO_AFTER_WORK5 * pat)
+
+    # Penalize isolated DO: Work–DO–Work
+    if W_PENALTY_ISOLATED_DO > 0:
+        for ai,a in enumerate(agent_ids):
+            for i in range(1, D-1):
+                d_prev, d_mid, d_next = days[i-1], days[i], days[i+1]
+                if any(locks.get((a,dd),None) in HARD_LEAVES for dd in [d_prev,d_mid,d_next]):
+                    continue
+                if tmpl_token[(a,d_mid)] == "DO":
+                    continue
+                wprev = is_work[(ai,i-1)]
+                wnext = is_work[(ai,i+1)]
+                if wprev is None or wnext is None:
+                    continue
+                pat = andify([wprev, x[(ai,i,"DO")], wnext], f"isol_do_{ai}_{i}")
+                obj_terms.append(W_PENALTY_ISOLATED_DO * pat)
+
+    # Penalize short-work before DO: (i-2 not work) + (i-1 work) + (i DO)
+    if W_PENALTY_SHORTWORK_BEFORE_DO > 0:
+        for ai,a in enumerate(agent_ids):
+            for i in range(2, D):
+                d0,d1,d2 = days[i-2], days[i-1], days[i]
+                if any(locks.get((a,dd),None) in HARD_LEAVES for dd in [d0,d1,d2]):
+                    continue
+                if tmpl_token[(a,d2)] == "DO":
+                    continue
+                w0 = is_work[(ai,i-2)]
+                w1 = is_work[(ai,i-1)]
+                if w0 is None or w1 is None:
+                    continue
+                not_w0 = model.NewBoolVar(f"notw0_{ai}_{i}")
+                model.Add(not_w0 == 1 - w0)
+                pat = andify([not_w0, w1, x[(ai,i,"DO")]], f"shortw_do_{ai}_{i}")
+                obj_terms.append(W_PENALTY_SHORTWORK_BEFORE_DO * pat)
+
+    # Penalize DODODO (3 DOs) when all are NON-PREF
+    if W_PENALTY_DODODO_NONPREF > 0:
+        for ai,a in enumerate(agent_ids):
+            for i in range(0, D-3+1):
+                ds = [days[i], days[i+1], days[i+2]]
+                if any(locks.get((a,dd),None) in HARD_LEAVES for dd in ds):
+                    continue
+                if any(tmpl_token[(a,dd)] == "DO" for dd in ds):
+                    continue
+                pat = andify([x[(ai,i,"DO")], x[(ai,i+1,"DO")], x[(ai,i+2,"DO")]], f"dododo_{ai}_{i}")
+                obj_terms.append(W_PENALTY_DODODO_NONPREF * pat)
+
+    # Fairness N range among males
+    if W_FAIR_N > 0 and "N" in WORK_SHIFTS:
+        male_idx=[i for i,a in enumerate(agent_ids) if meta[a]["gender"]=="M"]
+        if male_idx:
+            counts=[]
+            for ai2 in male_idx:
+                c=model.NewIntVar(0, D, f"cntN_{ai2}")
+                model.Add(c == sum(x[(ai2,di,"N")] for di in range(D)
+                                  if locks.get((agent_ids[ai2],days[di]),None) not in HARD_LEAVES))
+                counts.append(c)
+            mx=model.NewIntVar(0, D, "maxN")
+            mn=model.NewIntVar(0, D, "minN")
+            model.AddMaxEquality(mx, counts)
+            model.AddMinEquality(mn, counts)
+            rng=model.NewIntVar(0, D, "rangeN")
+            model.Add(rng == mx - mn)
+            obj_terms.append(W_FAIR_N * rng)
+
+    # Fairness evening group range among males
+    if W_FAIR_EVE > 0 and CAP_EVENING_SHIFTS:
+        male_idx=[i for i,a in enumerate(agent_ids) if meta[a]["gender"]=="M"]
+        if male_idx:
+            counts=[]
+            for ai2 in male_idx:
+                c=model.NewIntVar(0, D, f"cntEVE_{ai2}")
+                model.Add(
+                    c == sum(
+                        sum(x[(ai2,di,sh)] for sh in CAP_EVENING_SHIFTS if sh in WORK_SHIFTS)
+                        for di in range(D)
+                        if locks.get((agent_ids[ai2],days[di]),None) not in HARD_LEAVES
+                    )
+                )
+                counts.append(c)
+            mx=model.NewIntVar(0, D, "maxEVE")
+            mn=model.NewIntVar(0, D, "minEVE")
+            model.AddMaxEquality(mx, counts)
+            model.AddMinEquality(mn, counts)
+            rng=model.NewIntVar(0, D, "rangeEVE")
+            model.Add(rng == mx - mn)
+            obj_terms.append(W_FAIR_EVE * rng)
+
+    # Boost soft penalties
+    if (not hard_boost) and W_BOOST10 > 0 and boost_penalties:
+        obj_terms.append(W_BOOST10 * sum(boost_penalties))
+
+    # Smooth 10:00 distribution across WD days
+    if W_SMOOTH10 > 0 and "10:00" in WORK_SHIFTS:
+        wd_days=[di for di,d in enumerate(days) if daytype_of[d]=="WD"]
+        if wd_days:
+            counts=[]
+            for di in wd_days:
+                c=model.NewIntVar(0, A, f"cnt10_{di}")
+                model.Add(c == sum(x[(ai,di,"10:00")] for ai in range(A)))
+                counts.append(c)
+            mx=model.NewIntVar(0, A, "max10")
+            mn=model.NewIntVar(0, A, "min10")
+            model.AddMaxEquality(mx, counts)
+            model.AddMinEquality(mn, counts)
+            rng=model.NewIntVar(0, A, "range10")
+            model.Add(rng == mx - mn)
+            obj_terms.append(W_SMOOTH10 * rng)
+
+    if obj_terms:
+        model.Minimize(sum(obj_terms))
+
+    solver = cp_model.CpSolver()
+    solver.parameters.max_time_in_seconds = float(time_limit_s)
+    solver.parameters.num_search_workers = int(workers)
+
+    # Random seed restart
+    if random_seed is not None:
+        solver.parameters.random_seed = int(random_seed)
+
+    # Keep best objective inside time
+    solver.parameters.log_search_progress = False
+
+    res = solver.Solve(model)
+    feasible = res in (cp_model.OPTIMAL, cp_model.FEASIBLE)
+    obj_val = solver.ObjectiveValue() if feasible and obj_terms else None
+
+    return feasible, solver.StatusName(res), solver, x, TOKENS, period_of, daytype_of, obj_val
+
+# ----------------------------
+# STRICT VALIDATOR
+# ----------------------------
+def validate_roster(solution_map, ram_start, ram_end, gh_override):
+    errors=[]
+
+    def per_of(d):
+        if ram_start is None or ram_end is None:
+            return "Normal"
+        return "Ramadan" if (ram_start <= d <= ram_end) else "Normal"
+
+    def dt_of(d):
+        if gh_override is not None and d == gh_override:
+            return "GH"
+        return base_day_type(d)
+
+    male_only_shifts = set([s for s in WORK_SHIFTS if male_only.get(s,0)==1])
+
+    # HC + S1
+    for d in days:
+        per = per_of(d)
+        dt  = dt_of(d)
+        for sh in WORK_SHIFTS:
+            assigned = 0
+            assigned_s1 = 0
+            for a in agent_ids:
+                tok = solution_map.get((a,d), "")
+                if tok == sh:
+                    assigned += 1
+                    if meta[a]["s1"]:
+                        assigned_s1 += 1
+
+            req = demand.get(per, demand["Normal"])[dt].get(sh, 0)
+
+            if dt == "WD" and assigned < req:
+                errors.append(f"[HC_SHORTAGE] {d} {per} {dt} shift={sh} assigned={assigned} req={req}")
+
+            if require_exact(dt, sh) and assigned != req:
+                errors.append(f"[HC_EXACT_FAIL] {d} {per} {dt} shift={sh} assigned={assigned} req={req}")
+
+            req_s1 = s1_req.get(per, s1_req["Normal"])[dt].get(sh, 0)
+            if req_s1 > 0 and assigned_s1 < req_s1:
+                errors.append(f"[S1_SHORTAGE] {d} {per} {dt} shift={sh} s1_assigned={assigned_s1} req={req_s1}")
+
+    # Per-agent checks
+    for a in agent_ids:
+
+        # Hard locks
+        for d in days:
+            tok = solution_map.get((a,d), "")
+            if locks.get((a,d), None) in HARD_LEAVES:
+                if tok != locks[(a,d)]:
+                    errors.append(f"[LOCK_LEAVE_FAIL] agent={a} {d} expected={locks[(a,d)]} got={tok}")
+            if lock_reason.get((a,d),"") == "star":
+                if tok != tmpl_token[(a,d)]:
+                    errors.append(f"[LOCK_STAR_FAIL] agent={a} {d} expected={tmpl_token[(a,d)]} got={tok}")
+            if lock_reason.get((a,d),"") == "do_between_al":
+                if tok != "DO":
+                    errors.append(f"[LOCK_DO_BETWEEN_AL_FAIL] agent={a} {d} expected=DO got={tok}")
+
+        # Gender male-only
+        if meta[a]["gender"] != "M":
+            for d in days:
+                tok = solution_map.get((a,d), "")
+                if tok in male_only_shifts:
+                    errors.append(f"[MALE_ONLY] agent={a} assigned={tok} on {d}")
+
+        # DO count
+        do_cnt = 0
+        for d in days:
+            tok = solution_map.get((a,d), "")
+            if tok in HARD_LEAVES:
+                continue
+            if tok == "DO":
+                do_cnt += 1
+
+        if a in leave_agents:
+            if do_cnt > DO_TARGET:
+                errors.append(f"[DO_LEAVE_UPPER] agent={a} do_cnt={do_cnt} > {DO_TARGET}")
+        else:
+            if DO_EXACT and do_cnt != DO_TARGET:
+                errors.append(f"[DO_EXACT_FAIL] agent={a} do_cnt={do_cnt} != {DO_TARGET}")
+            if (not DO_EXACT) and do_cnt < max(0, DO_TARGET - DO_FALLBACK_MINUS):
+                errors.append(f"[DO_MIN_FAIL] agent={a} do_cnt={do_cnt} < min={max(0, DO_TARGET - DO_FALLBACK_MINUS)}")
+
+        # Caps
+        if meta[a]["gender"] == "M":
+            if MAX_N_PER_MALE is not None:
+                n_cnt = sum(1 for d in days if solution_map.get((a,d),"") == "N")
+                if n_cnt > MAX_N_PER_MALE:
+                    errors.append(f"[CAP_N] agent={a} n_cnt={n_cnt} > {MAX_N_PER_MALE}")
+            if MAX_EVENING_PER_MALE is not None and CAP_EVENING_SHIFTS:
+                eve_cnt = sum(1 for d in days if solution_map.get((a,d),"") in CAP_EVENING_SHIFTS)
+                if eve_cnt > MAX_EVENING_PER_MALE:
+                    errors.append(f"[CAP_EVE] agent={a} eve_cnt={eve_cnt} > {MAX_EVENING_PER_MALE}")
+
+        # Max consecutive workdays (history-aware)
+        ext=[]
+        for hd in hist_days:
+            ext.append(1 if hist_token.get((a,hd),"") in WORK_SHIFTS else 0)
+        for d in days:
+            tok = solution_map.get((a,d),"")
+            ext.append(1 if tok in WORK_SHIFTS else 0)
+
+        W = MAX_CONSEC + 1
+        for start in range(0, len(ext)-W+1):
+            if sum(ext[start:start+W]) > MAX_CONSEC:
+                errors.append(f"[MAX_CONSEC_WORK] agent={a} window_start_ext={start} sum={sum(ext[start:start+W])} > {MAX_CONSEC}")
+                break
+
+        # Rest (history-aware)
+        def sstart(tok):
+            return SHIFT_START.get(tok, None)
+
+        if hist_days:
+            prev_tok = hist_token.get((a, hist_days[-1]), "")
+            cur_tok  = solution_map.get((a, days[0]), "")
+            if prev_tok in WORK_SHIFTS and cur_tok in WORK_SHIFTS:
+                gap = (sstart(cur_tok)+24.0) - sstart(prev_tok)
+                if gap < MIN_REST_HOURS - 1e-9:
+                    errors.append(f"[REST_FAIL] agent={a} {hist_days[-1]}:{prev_tok} -> {days[0]}:{cur_tok} gap={gap:.2f} < {MIN_REST_HOURS}")
+
+        for i in range(D-1):
+            t1 = solution_map.get((a,days[i]),"")
+            t2 = solution_map.get((a,days[i+1]),"")
+            if t1 in WORK_SHIFTS and t2 in WORK_SHIFTS:
+                gap = (sstart(t2)+24.0) - sstart(t1)
+                if gap < MIN_REST_HOURS - 1e-9:
+                    errors.append(f"[REST_FAIL] agent={a} {days[i]}:{t1} -> {days[i+1]}:{t2} gap={gap:.2f} < {MIN_REST_HOURS}")
+                    break
+
+        # Night rules (history-aware)
+        extTok=[]
+        for hd in hist_days:
+            extTok.append(hist_token.get((a,hd),""))
+        for d in days:
+            extTok.append(solution_map.get((a,d),""))
+
+        if NIGHT_MAX_CONSEC == 2:
+            for i in range(0, len(extTok)-2):
+                if extTok[i]=="N" and extTok[i+1]=="N" and extTok[i+2]=="N":
+                    errors.append(f"[N_MAX_CONSEC] agent={a} NNN around idx={i}")
+                    break
+
+        for i in range(0, len(extTok)-1):
+            if extTok[i]=="N":
+                nxt = extTok[i+1]
+                if nxt not in ("N","DO") and nxt not in HARD_LEAVES:
+                    errors.append(f"[N_FOLLOW] agent={a} idx={i} N followed by {nxt}")
+                    break
+
+        for i in range(0, len(extTok)-3):
+            if extTok[i]=="N" and extTok[i+1]=="DO" and extTok[i+2]=="N" and extTok[i+3]=="DO":
+                errors.append(f"[NDO_NDO] agent={a} pattern NDO NDO at idx={i}")
+                break
+
+        for i in range(0, len(extTok)-3):
+            if extTok[i]=="N" and extTok[i+1]=="N":
+                if extTok[i+2] not in ("DO",) and extTok[i+2] not in HARD_LEAVES:
+                    errors.append(f"[NN_DO1] agent={a} idx={i+2} got={extTok[i+2]}")
+                    break
+                if extTok[i+3] not in ("DO",) and extTok[i+3] not in HARD_LEAVES:
+                    errors.append(f"[NN_DO2] agent={a} idx={i+3} got={extTok[i+3]}")
+                    break
+
+        # Hard DO streak nonpref
+        if MAX_DO_STREAK_NONPREF is not None:
+            streak = 0
+            streak_start = None
+            all_nonpref = True
+            prev_d = None
+            for d in days:
+                tok = solution_map.get((a,d),"")
+                if tok == "DO":
+                    if streak == 0:
+                        streak_start = d
+                        all_nonpref = True
+                    if tmpl_token[(a,d)] == "DO":
+                        all_nonpref = False
+                    streak += 1
+                else:
+                    if streak > MAX_DO_STREAK_NONPREF and all_nonpref:
+                        errors.append(f"[DO_STREAK_NONPREF] agent={a} DO run={streak} (>{MAX_DO_STREAK_NONPREF}) | {streak_start}..{prev_d}")
+                        break
+                    streak = 0
+                    streak_start = None
+                prev_d = d
+            if streak > MAX_DO_STREAK_NONPREF and all_nonpref:
+                errors.append(f"[DO_STREAK_NONPREF] agent={a} DO run={streak} (>{MAX_DO_STREAK_NONPREF}) | {streak_start}..{days[-1]}")
+
+    # Meeting validator: exactly 1 meeting day per supervisor
+    def meeting_candidate_day(d):
+        if d.day < MEETING_MIN_DAY or d.day > MEETING_MAX_DAY:
+            return False
+        if MEETING_WD_ONLY and dt_of(d) != "WD":
+            return False
+        return True
+
+    meeting_days = [d for d in days if meeting_candidate_day(d)]
+    for sup in supervisors:
+        team = sup_to_team[sup]
+        ok_days=[]
+        for d in meeting_days:
+            req_shift = MEET_SHIFT_RAMADAN if per_of(d)=="Ramadan" else MEET_SHIFT_NORMAL
+            good=True
+            for a2 in team:
+                if locks.get((a2,d),None) in HARD_LEAVES:
+                    continue
+                if lock_reason.get((a2,d),"") == "do_between_al":
+                    continue
+                if solution_map.get((a2,d),"") != req_shift:
+                    good=False
+                    break
+            if good:
+                ok_days.append(d)
+        if len(ok_days) != 1:
+            errors.append(f"[MEETING_FAIL] supervisor={sup} meeting_days_found={len(ok_days)} expected=1 days={ok_days[:5]}")
+
+    return (len(errors)==0), errors
+
+# ----------------------------
+# Metrics (preference kept %, DO distribution quality)
+# ----------------------------
+def compute_metrics(solution_map):
+    # Preference kept % (nonlocked vs all pref)
+    pref_total = 0
+    pref_kept  = 0
+    pref_total_all = 0
+    pref_kept_all  = 0
+
+    for a in agent_ids:
+        for d in days:
+            pref = tmpl_token[(a,d)]
+            if not pref:
+                continue
+            if pref in HARD_LEAVES:
+                continue
+            if (pref not in WORK_SHIFTS) and (pref != "DO"):
+                continue
+
+            tok = solution_map[(a,d)]
+
+            pref_total_all += 1
+            if tok == pref:
+                pref_kept_all += 1
+
+            if (a,d) in locks:
+                continue
+            pref_total += 1
+            if tok == pref:
+                pref_kept += 1
+
+    pref_pct_nonlocked = (100.0 * pref_kept / pref_total) if pref_total > 0 else 0.0
+    pref_pct_all = (100.0 * pref_kept_all / pref_total_all) if pref_total_all > 0 else 0.0
+
+    # DO blocks distribution
+    runs_1 = 0
+    runs_2 = 0
+    runs_3p = 0
+    total_runs = 0
+
+    do_days_total = 0
+    do_days_in_2run = 0
+
+    blocks_after_work4 = 0
+    blocks_after_work5 = 0
+
+    for a in agent_ids:
+        seq = [solution_map[(a,d)] for d in days]
+        i = 0
+        while i < len(seq):
+            if seq[i] == "DO":
+                j = i
+                while j < len(seq) and seq[j] == "DO":
+                    j += 1
+                L = j - i
+
+                total_runs += 1
+                do_days_total += L
+
+                if L == 1:
+                    runs_1 += 1
+                elif L == 2:
+                    runs_2 += 1
+                    do_days_in_2run += 2
+                else:
+                    runs_3p += 1
+
+                # work streak before this DO block
+                streak = 0
+                k = i - 1
+                while k >= 0 and seq[k] in WORK_SHIFTS:
+                    streak += 1
+                    k -= 1
+                if streak >= 4:
+                    blocks_after_work4 += 1
+                if streak >= 5:
+                    blocks_after_work5 += 1
+
+                i = j
+            else:
+                i += 1
+
+    pct_1 = 100.0 * runs_1 / total_runs if total_runs else 0.0
+    pct_2 = 100.0 * runs_2 / total_runs if total_runs else 0.0
+    pct_3p = 100.0 * runs_3p / total_runs if total_runs else 0.0
+
+    pct_blocks_after_work4 = 100.0 * blocks_after_work4 / total_runs if total_runs else 0.0
+    pct_blocks_after_work5 = 100.0 * blocks_after_work5 / total_runs if total_runs else 0.0
+    pct_do_days_in_2run = 100.0 * do_days_in_2run / do_days_total if do_days_total else 0.0
+
+    return {
+        "pref_pct_nonlocked": pref_pct_nonlocked,
+        "pref_pct_all": pref_pct_all,
+        "do_blocks_total": total_runs,
+        "do_blocks_1": runs_1,
+        "do_blocks_2": runs_2,
+        "do_blocks_3p": runs_3p,
+        "do_blocks_pct_1": pct_1,
+        "do_blocks_pct_2": pct_2,
+        "do_blocks_pct_3p": pct_3p,
+        "do_blocks_after_work4": blocks_after_work4,
+        "do_blocks_pct_after_work4": pct_blocks_after_work4,
+        "do_blocks_after_work5": blocks_after_work5,
+        "do_blocks_pct_after_work5": pct_blocks_after_work5,
+        "do_days_total": do_days_total,
+        "do_days_pct_in_2run": pct_do_days_in_2run,
+    }
+
+# ----------------------------
+# Solve scenarios with prefix locking + best objective (score) per scenario
+# ----------------------------
+outputs=[]
+
+for si,(ram_s, ram_e, gh_day) in enumerate(scenarios, start=1):
+    tag=f"S{si}"
+    print("\n==============================")
+    print(f"Scenario {tag}: Ramadan[{ram_s}..{ram_e}] GH_override={gh_day}")
+    print("==============================")
+
+    # Use prefix locks if already built
+    extra_prefix = prefix_locks
+
+    best = None  # (objective_value_or_None, solution_map, status_name, hard_boost_used, seed_used)
+
+    # We do multiple restarts, try HARD boost first, then SOFT boost if needed
+    for attempt in ["HARD", "SOFT"]:
+        hard_boost = (attempt == "HARD")
+
+        for r_i in range(max(1, SOLVER_RESTARTS)):
+            seed = SOLVER_RAND_BASE + 97*si + 13*r_i + (0 if hard_boost else 9999)
+
+            feasible, status, solver, x, TOKENS, period_of, daytype_of, obj_val = solve_one_scenario(
+                ram_s, ram_e, gh_day,
+                hard_boost=hard_boost,
+                extra_prefix_locks=extra_prefix,
+                time_limit_s=SOLVER_TIME_SECONDS,
+                workers=SOLVER_WORKERS,
+                random_seed=seed
+            )
+
+            if not feasible:
+                continue
+
+            # Build solution_map
+            solution_map={}
+            for ai,a in enumerate(agent_ids):
+                for di,d in enumerate(days):
+                    locked = locks.get((a,d), None)
+                    if locked in HARD_LEAVES:
+                        solution_map[(a,d)] = locked
+                        continue
+                    chosen=""
+                    for t in TOKENS:
+                        if solver.Value(x[(ai,di,t)]) == 1:
+                            chosen=t
+                            break
+                    solution_map[(a,d)] = chosen
+
+            ok, errs = validate_roster(solution_map, ram_s, ram_e, gh_day)
+            if not ok:
+                continue
+
+            # Objective comparison (lower is better). If no objective, treat as 0.
+            val = float(obj_val) if obj_val is not None else 0.0
+
+            if best is None or val < best[0]:
+                best = (val, solution_map, status, hard_boost, seed)
+
+        # If we found a valid best in HARD mode, no need to try SOFT
+        if best is not None and hard_boost:
+            break
+
+    if best is None:
+        print("❌ No validated roster found for this scenario (even after restarts). Skipping.")
+        continue
+
+    best_val, solution_map, best_status, used_hard_boost, used_seed = best
+    print(f"✅ Best validated solution found | attempt={'HARD' if used_hard_boost else 'SOFT'} | seed={used_seed} | objective={best_val:.2f}")
+
+    # Build prefix locks AFTER FIRST solved scenario
+    if (prefix_locks is None) and prefix_days:
+        prefix_locks={}
+        for a in agent_ids:
+            for d in prefix_days:
+                if locks.get((a,d),None) in HARD_LEAVES:
+                    continue
+                prefix_locks[(a,d)] = solution_map[(a,d)]
+        print(f"✅ Built prefix locks from scenario {tag} (common before {min(ram_starts)})")
+
+    # Compute metrics
+    metrics = compute_metrics(solution_map)
+
+    print("\n--- SUMMARY METRICS ---")
+    print(f"Preference kept % (nonlocked) : {metrics['pref_pct_nonlocked']:.1f}%")
+    print(f"Preference kept % (all pref)  : {metrics['pref_pct_all']:.1f}%")
+    print(f"DO blocks total               : {metrics['do_blocks_total']}")
+    print(f"DO blocks 1 / 2 / 3+          : {metrics['do_blocks_1']} / {metrics['do_blocks_2']} / {metrics['do_blocks_3p']}")
+    print(f"DO block % 1 / 2 / 3+         : {metrics['do_blocks_pct_1']:.1f}% / {metrics['do_blocks_pct_2']:.1f}% / {metrics['do_blocks_pct_3p']:.1f}%")
+    print(f"DO blocks after 4+ workdays   : {metrics['do_blocks_after_work4']} ({metrics['do_blocks_pct_after_work4']:.1f}%)")
+    print(f"DO blocks after 5+ workdays   : {metrics['do_blocks_after_work5']} ({metrics['do_blocks_pct_after_work5']:.1f}%)")
+    print(f"% DO days inside 2-DO blocks  : {metrics['do_days_pct_in_2run']:.1f}%")
+
+    # Write output with strong preference markers + Summary sheet
+    wb_out = load_workbook(agent_name)
+    ws_out = wb_out.active
+
+    # markers styles
+    lavender = PatternFill("solid", fgColor="E6E6FA")
+    thick_side = Side(style="thick", color="000000")
+    thick_border = Border(left=thick_side, right=thick_side, top=thick_side, bottom=thick_side)
+
+    # Write roster cells
+    for rr,a in zip(agent_rows, agent_ids):
+        for d in days:
+            col = col_for_day[d]
+            tok = solution_map[(a,d)]
+            ws_out.cell(rr,col).value = tok
+
+            # preference markers only for non-locked
+            if (a,d) in locks:
+                continue
+            pref = tmpl_token[(a,d)]
+            if not pref:
+                continue
+            if pref in HARD_LEAVES:
+                continue
+            if (pref not in WORK_SHIFTS) and (pref != "DO"):
+                continue
+
+            cell = ws_out.cell(rr,col)
+            if tok == pref:
+                cell.border = thick_border
+            else:
+                cell.fill = lavender
+
+    # Add a Summary sheet
+    if "Summary" in wb_out.sheetnames:
+        del wb_out["Summary"]
+    ws_sum = wb_out.create_sheet("Summary")
+
+    ws_sum["A1"] = "Scenario Tag"
+    ws_sum["B1"] = tag
+    ws_sum["A2"] = "Ramadan Start"
+    ws_sum["B2"] = str(ram_s)
+    ws_sum["A3"] = "Ramadan End"
+    ws_sum["B3"] = str(ram_e)
+    ws_sum["A4"] = "GH Override"
+    ws_sum["B4"] = str(gh_day)
+    ws_sum["A5"] = "Objective (score, lower=better)"
+    ws_sum["B5"] = float(best_val)
+
+    row = 7
+    ws_sum[f"A{row}"] = "Preference kept % (nonlocked)"
+    ws_sum[f"B{row}"] = round(metrics["pref_pct_nonlocked"], 2); row += 1
+    ws_sum[f"A{row}"] = "Preference kept % (all pref)"
+    ws_sum[f"B{row}"] = round(metrics["pref_pct_all"], 2); row += 2
+
+    ws_sum[f"A{row}"] = "DO blocks total"
+    ws_sum[f"B{row}"] = metrics["do_blocks_total"]; row += 1
+    ws_sum[f"A{row}"] = "DO blocks 1"
+    ws_sum[f"B{row}"] = metrics["do_blocks_1"]; row += 1
+    ws_sum[f"A{row}"] = "DO blocks 2"
+    ws_sum[f"B{row}"] = metrics["do_blocks_2"]; row += 1
+    ws_sum[f"A{row}"] = "DO blocks 3+"
+    ws_sum[f"B{row}"] = metrics["do_blocks_3p"]; row += 2
+
+    ws_sum[f"A{row}"] = "DO block % 1"
+    ws_sum[f"B{row}"] = round(metrics["do_blocks_pct_1"], 2); row += 1
+    ws_sum[f"A{row}"] = "DO block % 2"
+    ws_sum[f"B{row}"] = round(metrics["do_blocks_pct_2"], 2); row += 1
+    ws_sum[f"A{row}"] = "DO block % 3+"
+    ws_sum[f"B{row}"] = round(metrics["do_blocks_pct_3p"], 2); row += 2
+
+    ws_sum[f"A{row}"] = "DO blocks after 4+ workdays"
+    ws_sum[f"B{row}"] = metrics["do_blocks_after_work4"]; row += 1
+    ws_sum[f"A{row}"] = "DO blocks % after 4+ workdays"
+    ws_sum[f"B{row}"] = round(metrics["do_blocks_pct_after_work4"], 2); row += 1
+
+    ws_sum[f"A{row}"] = "DO blocks after 5+ workdays"
+    ws_sum[f"B{row}"] = metrics["do_blocks_after_work5"]; row += 1
+    ws_sum[f"A{row}"] = "DO blocks % after 5+ workdays"
+    ws_sum[f"B{row}"] = round(metrics["do_blocks_pct_after_work5"], 2); row += 2
+
+    ws_sum[f"A{row}"] = "% DO days inside 2-DO blocks"
+    ws_sum[f"B{row}"] = round(metrics["do_days_pct_in_2run"], 2); row += 1
+
+    out_name = f"Roster_SOLVED_{year_ref}{month_ref:02d}_{tag}.xlsx"
+    wb_out.save(out_name)
+    print("\nSaved:", out_name)
+    files.download(out_name)
+    outputs.append(out_name)
+
+if not outputs:
+    raise RuntimeError("No scenario produced a validated roster. Check constraints/params.")
+
+print("\n✅ Done. Generated:", outputs)
